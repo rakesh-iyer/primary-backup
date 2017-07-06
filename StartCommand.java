@@ -1,7 +1,7 @@
-class BackupCommand extends Command {
+class StartCommand extends Command {
     boolean forwarded;
 
-    BackupCommand() {
+    StartCommand() {
         super.setType("BACKUP_COMMAND");
     }
 
