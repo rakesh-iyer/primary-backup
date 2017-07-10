@@ -3,7 +3,6 @@ import java.util.concurrent.*;
 
 class PrimaryBackupServer implements Runnable {
     List<Command> acceptedCommands = new ArrayList<>();
-    boolean primary;
     BlockingQueue<Message> messageQueue = new LinkedBlockingQueue<>();
     Queue<Command> blockedCommandQueue = new LinkedList<>();
     Map<String, Command> blockedAckMap = new HashMap<>();
@@ -20,7 +19,20 @@ class PrimaryBackupServer implements Runnable {
         setServerChain(portChain);
 
         messageReceiver = new MessageReceiver(messageQueue, port);
-        new Thread(this).start();
+        new Thread(messageReceiver).start();
+    }
+
+    void addCommand() {
+        StartCommand sc = new StartCommand();
+
+        sc.setId(UUID.randomUUID().toString());
+        sc.setTimeStamp(getCurrentTimeStamp());
+        sc.setData("Data");
+        try {
+            sendToHost(sc, port);
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
     }
 
     void setServerChain(List<Integer> portChain) {
@@ -37,14 +49,17 @@ class PrimaryBackupServer implements Runnable {
     }
 
     void sendToHost(Message m, int port) {
+        m.setSenderPort(this.port);
         MessageSender.send(m, port);
     }
 
     void sendToPrimary(Message m) {
+        m.setSenderPort(this.port);
         MessageSender.send(m, portChain.get(0));
     }
 
     void sendToFirstBackup(Message m) {
+        m.setSenderPort(this.port);
         MessageSender.send(m, portChain.get(1));
     }
 
@@ -59,6 +74,7 @@ class PrimaryBackupServer implements Runnable {
 
         // only send if there is a backup.
         if (i + 1 < portChain.size()) {
+            m.setSenderPort(this.port);
             MessageSender.send(m, portChain.get(i+1));
         }
     }
@@ -93,8 +109,6 @@ class PrimaryBackupServer implements Runnable {
             blockedAckMap.put(c.getId(), c);
         } else if (c.getType().equals("ACK_COMMAND")) {
             Command cAcked  = blockedAckMap.remove(c.getId());
-
-            System.out.println("Got ack for " + cAcked);
         } else if (c.getType().equals("FORWARD_COMMAND")) {
             // update its copy.
             int forwardingPort = c.getSenderPort();
@@ -137,6 +151,8 @@ class PrimaryBackupServer implements Runnable {
             c.copy(fc); 
             sendToPrimary(fc);
             blockedAckMap.put(c.getId(), c);
+        } else if (c.getType().equals("ACK_COMMAND")) {
+            Command cAcked  = blockedAckMap.remove(c.getId());
         }
     }
 
@@ -151,7 +167,6 @@ class PrimaryBackupServer implements Runnable {
                 } else {
                     c = blockedCommandQueue.remove();
                 }
-
                 // if blocked for ack just queue any other commands.
                 if (isBlockedForAck() && !c.getType().equals("ACK_COMMAND")) {
                     blockedCommandQueue.add(c);

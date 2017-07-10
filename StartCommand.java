@@ -2,7 +2,7 @@ class StartCommand extends Command {
     boolean forwarded;
 
     StartCommand() {
-        super.setType("BACKUP_COMMAND");
+        super.setType("START_COMMAND");
     }
 
     boolean isForwarded() {
