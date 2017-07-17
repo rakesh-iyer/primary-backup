@@ -6,6 +6,8 @@ class PrimaryBackupServer implements Runnable {
     BlockingQueue<Message> messageQueue = new LinkedBlockingQueue<>();
     Queue<Command> blockedCommandQueue = new LinkedList<>();
     Map<String, Command> blockedAckMap = new HashMap<>();
+    Map<String, Command> blockedConfigChangeAckMap = new HashMap<>();
+    List<Command> stoppedCommands = new ArrayList<>();
     MessageReceiver messageReceiver;
     Map<Integer, Long> healthyTime = new HashMap<>();
 
@@ -13,6 +15,7 @@ class PrimaryBackupServer implements Runnable {
     List<Integer> portChain;
 
     boolean stopThread;
+    boolean stopped;
 
     PrimaryBackupServer(int port, List<Integer> portChain) {
         this.port = port;
@@ -20,6 +23,10 @@ class PrimaryBackupServer implements Runnable {
 
         messageReceiver = new MessageReceiver(messageQueue, port);
         new Thread(messageReceiver).start();
+    }
+
+    boolean isUserCommand(Command c) {
+        return c.getType().equals("START_COMMAND");
     }
 
     void addCommand() {
@@ -35,6 +42,14 @@ class PrimaryBackupServer implements Runnable {
         }
     }
 
+    boolean isBlockedForAck() {
+        return blockedAckMap.size() > 0;
+    }
+
+    boolean isBlockedForConfigChangeAck() {
+        return blockedConfigChangeAckMap.size() > 0;
+    }
+
     void setServerChain(List<Integer> portChain) {
         this.portChain = portChain;
     }
@@ -42,6 +57,14 @@ class PrimaryBackupServer implements Runnable {
     // needs synchronization?
     void setPortChain(List<Integer> portChain) {
         this.portChain = portChain;
+    }
+
+    boolean isStopped() {
+        return stopped;
+    }
+
+    void setStopped(boolean stopped) {
+        this.stopped = stopped;
     }
 
     void sendAckToUser(Command c) {
@@ -95,10 +118,6 @@ class PrimaryBackupServer implements Runnable {
         return System.currentTimeMillis();
     }
 
-    boolean isBlockedForAck() {
-        return blockedAckMap.size() > 0;
-    }
-
     void processAsPrimary(Command c) {
         if (c.getType().equals("START_COMMAND")) {
             // update its copy.
@@ -107,8 +126,6 @@ class PrimaryBackupServer implements Runnable {
             c.copy(cc);
             sendToFirstBackup(cc);
             blockedAckMap.put(c.getId(), c);
-        } else if (c.getType().equals("ACK_COMMAND")) {
-            Command cAcked  = blockedAckMap.remove(c.getId());
         } else if (c.getType().equals("FORWARD_COMMAND")) {
             // update its copy.
             int forwardingPort = c.getSenderPort();
@@ -122,6 +139,12 @@ class PrimaryBackupServer implements Runnable {
             sendToFirstBackup(rc);
             sendAckToUser(c);
             sendToHost(ac, forwardingPort);
+        } else if (c.getType().equals("CONFIG_CHANGE_COMMAND")) {
+            // send to all other hosts, maybe only the ones in the new config.
+            // accept the config change.
+            // send command to others to resume new user traffic after processing stopped traffic.
+        } else if (c.getType().equals("ACK_COMMAND")) {
+            blockedAckMap.remove(c.getId());
         }
     }
 
@@ -143,16 +166,33 @@ class PrimaryBackupServer implements Runnable {
 
             sendAckToUser(c);
             sendToPrimary(ac);
-        } else if (c.getType().equals("REPL_COMMAND")) {
-            sendToNextBackup(c); 
         } else if (c.getType().equals("START_COMMAND")) {
             ForwardCommand fc = new ForwardCommand();
 
             c.copy(fc); 
             sendToPrimary(fc);
             blockedAckMap.put(c.getId(), c);
+        } else if (c.getType().equals("REPL_COMMAND")) {
+            sendToNextBackup(c);
+        } else if (c.getType().equals("CONFIG_CHANGE_COMMAND")) {
+            setStopped(true);
+            // set new config.
         } else if (c.getType().equals("ACK_COMMAND")) {
-            Command cAcked  = blockedAckMap.remove(c.getId());
+            blockedAckMap.remove(c.getId());
+        }
+    }
+
+    void processCommand(Command c) {
+        if (isPrimary()) {
+            processAsPrimary(c);
+            if (isStopped() && !isBlockedForAck() && isBlockedForConfigChangeAck()) {
+                // all acks received, send command to resume user commands for all hosts
+            }
+        } else {
+            processAsBackup(c);
+            if (isStopped() && !isBlockedForAck()) {
+                // all acks received apply config change and return ack
+            }
         }
     }
 
@@ -160,24 +200,23 @@ class PrimaryBackupServer implements Runnable {
         try {
             while (!stopThread) {
                 Command c;
-                // Initial impl - dont worry about ack timeouts or timestamps for now.
-                // if you are blocked for ack then process message queue for any acks first.
-                if (isBlockedForAck() || blockedCommandQueue.size() == 0) {
-                    c = (Command)messageQueue.take();
-                } else {
-                    c = blockedCommandQueue.remove();
-                }
-                // if blocked for ack just queue any other commands.
-                if (isBlockedForAck() && !c.getType().equals("ACK_COMMAND")) {
-                    blockedCommandQueue.add(c);
-                    continue;
-                }
 
-                if (isPrimary()) {
-                    processAsPrimary(c);
-                } else {
-                    processAsBackup(c);
+                c = (Command)messageQueue.take();
+
+                if (isStopped()) {
+                    if (isUserCommand(c)) {
+                        stoppedCommands.add(c);
+                        continue;
+                    } else if (c.getType().equals("RESUME_COMMAND")) {
+                        setStopped(false);
+                        // process all stopped start commands before any new ones.
+                        for (Command sc : stoppedCommands) {
+                            processCommand(sc);
+                        }
+                        continue;
+                    }
                 }
+                processCommand(c);
             }
         } catch (Exception e) {
             e.printStackTrace();
