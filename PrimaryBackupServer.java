@@ -7,19 +7,20 @@ class PrimaryBackupServer implements Runnable {
     Queue<Command> blockedCommandQueue = new LinkedList<>();
     Map<String, Command> blockedAckMap = new HashMap<>();
     Map<String, Command> blockedConfigChangeAckMap = new HashMap<>();
-    List<Command> stoppedCommands = new ArrayList<>();
+    List<Command> pausedCommands = new ArrayList<>();
     MessageReceiver messageReceiver;
     Map<Integer, Long> healthyTime = new HashMap<>();
 
     int port;
     List<Integer> portChain;
+    ConfigChangeCommand configChangeCommand;
 
     boolean stopThread;
-    boolean stopped;
+    boolean paused;
 
     PrimaryBackupServer(int port, List<Integer> portChain) {
         this.port = port;
-        setServerChain(portChain);
+        setPortChain(portChain);
 
         messageReceiver = new MessageReceiver(messageQueue, port);
         new Thread(messageReceiver).start();
@@ -50,21 +51,26 @@ class PrimaryBackupServer implements Runnable {
         return blockedConfigChangeAckMap.size() > 0;
     }
 
-    void setServerChain(List<Integer> portChain) {
-        this.portChain = portChain;
-    }
-
     // needs synchronization?
     void setPortChain(List<Integer> portChain) {
         this.portChain = portChain;
     }
 
-    boolean isStopped() {
-        return stopped;
+    ConfigChangeCommand getConfigChangeCommand() {
+        return configChangeCommand;
     }
 
-    void setStopped(boolean stopped) {
-        this.stopped = stopped;
+    // needs synchronization?
+    void setConfigChangeCommand(ConfigChangeCommand ccc) {
+        this.configChangeCommand = ccc;
+    }
+
+    boolean isPaused() {
+        return paused;
+    }
+
+    void setPaused(boolean paused) {
+        this.paused = paused;
     }
 
     void sendAckToUser(Command c) {
@@ -84,6 +90,13 @@ class PrimaryBackupServer implements Runnable {
     void sendToFirstBackup(Message m) {
         m.setSenderPort(this.port);
         MessageSender.send(m, portChain.get(1));
+    }
+
+    void sendToDesignatedBackups(Message m, List<Integer> portChain) {
+        for (int i = 1; i < portChain.size(); i++) {
+            m.setSenderPort(this.port);
+            MessageSender.send(m, portChain.get(i));
+        }
     }
 
     void sendToNextBackup(Message m) {
@@ -118,6 +131,18 @@ class PrimaryBackupServer implements Runnable {
         return System.currentTimeMillis();
     }
 
+    void resumeProcessing() {
+        setPaused(false);
+        // process all paused start commands before any new ones.
+        for (Command pc : pausedCommands) {
+            if (isPrimary()) {
+                processAsPrimary(pc);
+            } else {
+                processAsBackup(pc);
+            }
+        }
+    }
+
     void processAsPrimary(Command c) {
         if (c.getType().equals("START_COMMAND")) {
             // update its copy.
@@ -140,11 +165,27 @@ class PrimaryBackupServer implements Runnable {
             sendAckToUser(c);
             sendToHost(ac, forwardingPort);
         } else if (c.getType().equals("CONFIG_CHANGE_COMMAND")) {
-            // send to all other hosts, maybe only the ones in the new config.
-            // accept the config change.
-            // send command to others to resume new user traffic after processing stopped traffic.
+            ConfigChangeCommand ccc = (ConfigChangeCommand)c;
+            // store config change command and apply when all commands are processed.
+            // send to all backups as specified in the new config.
+            setPaused(true);
+            setConfigChangeCommand(ccc);
+            sendToDesignatedBackups(ccc, ccc.getPortChain());
         } else if (c.getType().equals("ACK_COMMAND")) {
             blockedAckMap.remove(c.getId());
+        }
+
+        if (isPaused() && !isBlockedForAck() && !isBlockedForConfigChangeAck()) {
+            // all acks received
+            // accept the config change.
+            // send command to others to resume new user traffic after processing paused traffic.
+            ConfigChangeCommand ccc = getConfigChangeCommand();
+            setPortChain(ccc.getPortChain());
+            setConfigChangeCommand(null);
+
+            ResumeCommand rc = new ResumeCommand();
+            sendToDesignatedBackups(rc, ccc.getPortChain());
+            resumeProcessing();
         }
     }
 
@@ -175,48 +216,43 @@ class PrimaryBackupServer implements Runnable {
         } else if (c.getType().equals("REPL_COMMAND")) {
             sendToNextBackup(c);
         } else if (c.getType().equals("CONFIG_CHANGE_COMMAND")) {
-            setStopped(true);
-            // set new config.
+            ConfigChangeCommand ccc = (ConfigChangeCommand)c;
+            // store config change command and apply when all commands are processed.
+            setPaused(true);
+            setConfigChangeCommand(ccc);
+        } else if (c.getType().equals("RESUME_COMMAND")) {
+            resumeProcessing();
         } else if (c.getType().equals("ACK_COMMAND")) {
             blockedAckMap.remove(c.getId());
         }
-    }
 
-    void processCommand(Command c) {
-        if (isPrimary()) {
-            processAsPrimary(c);
-            if (isStopped() && !isBlockedForAck() && isBlockedForConfigChangeAck()) {
-                // all acks received, send command to resume user commands for all hosts
-            }
-        } else {
-            processAsBackup(c);
-            if (isStopped() && !isBlockedForAck()) {
-                // all acks received apply config change and return ack
-            }
+        if (isPaused() && !isBlockedForAck()) {
+            // all acks received apply config change and return ack
+            ConfigChangeCommand ccc = getConfigChangeCommand();
+            setPortChain(ccc.getPortChain());
+            setConfigChangeCommand(null);
+
+            AckCommand ac = new AckCommand();
+            ac.setId(ccc.getId());
+            sendToHost(ac, ccc.getSenderPort());
         }
     }
 
     void process() {
         try {
             while (!stopThread) {
-                Command c;
+                Command c = (Command)messageQueue.take();
 
-                c = (Command)messageQueue.take();
-
-                if (isStopped()) {
-                    if (isUserCommand(c)) {
-                        stoppedCommands.add(c);
-                        continue;
-                    } else if (c.getType().equals("RESUME_COMMAND")) {
-                        setStopped(false);
-                        // process all stopped start commands before any new ones.
-                        for (Command sc : stoppedCommands) {
-                            processCommand(sc);
-                        }
-                        continue;
-                    }
+                if (isPaused() && isUserCommand(c)) {
+                    pausedCommands.add(c);
+                    continue;
                 }
-                processCommand(c);
+
+                if (isPrimary()) {
+                    processAsPrimary(c);
+                } else {
+                    processAsBackup(c);
+                }
             }
         } catch (Exception e) {
             e.printStackTrace();
