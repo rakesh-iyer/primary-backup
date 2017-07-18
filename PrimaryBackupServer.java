@@ -15,6 +15,8 @@ class PrimaryBackupServer implements Runnable {
     List<Integer> portChain;
     ConfigChangeCommand configChangeCommand;
 
+    long startTimeStamp = getCurrentTimeStamp();
+
     boolean stopThread;
     boolean paused;
 
@@ -38,6 +40,25 @@ class PrimaryBackupServer implements Runnable {
         sc.setData("Data");
         try {
             sendToHost(sc, port);
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    void addConfigChangeCommand() {
+        ConfigChangeCommand ccc = new ConfigChangeCommand();
+
+        List<Integer> portChain = new ArrayList<>();
+
+        // reverse the config
+        portChain.add(this.portChain.get(1));
+        portChain.add(this.portChain.get(0));
+
+        ccc.setId(UUID.randomUUID().toString());
+        ccc.setTimeStamp(getCurrentTimeStamp());
+        ccc.setPortChain(portChain);
+        try {
+            sendToHost(ccc, port);
         } catch (Exception e) {
             e.printStackTrace();
         }
@@ -93,7 +114,10 @@ class PrimaryBackupServer implements Runnable {
     }
 
     void sendToDesignatedBackups(Message m, List<Integer> portChain) {
-        for (int i = 1; i < portChain.size(); i++) {
+        for (int i = 0; i < portChain.size(); i++) {
+            if (portChain.get(i) == port) {
+                continue;
+            }
             m.setSenderPort(this.port);
             MessageSender.send(m, portChain.get(i));
         }
@@ -250,6 +274,10 @@ class PrimaryBackupServer implements Runnable {
 
                 if (isPrimary()) {
                     processAsPrimary(c);
+                    if (getCurrentTimeStamp() > startTimeStamp + 110000) {
+                        addConfigChangeCommand();
+                        startTimeStamp = getCurrentTimeStamp(); 
+                    }
                 } else {
                     processAsBackup(c);
                 }
