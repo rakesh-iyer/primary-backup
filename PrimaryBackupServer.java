@@ -15,8 +15,6 @@ class PrimaryBackupServer implements Runnable {
     List<Integer> portChain;
     ConfigChangeCommand configChangeCommand;
 
-    long startTimeStamp = getCurrentTimeStamp();
-
     boolean stopThread;
     boolean paused;
 
@@ -26,6 +24,19 @@ class PrimaryBackupServer implements Runnable {
 
         messageReceiver = new MessageReceiver(messageQueue, port);
         new Thread(messageReceiver).start();
+
+        if (isPrimary()) {
+            new Thread() {
+                public void run() {
+                    try {
+                        Thread.sleep(120000);
+                        addConfigChangeCommand();
+                    } catch (Exception e) {
+                        e.printStackTrace();
+                    }
+                }
+            }.start();
+        }
     }
 
     boolean isUserCommand(Command c) {
@@ -194,12 +205,15 @@ class PrimaryBackupServer implements Runnable {
             // send to all backups as specified in the new config.
             setPaused(true);
             setConfigChangeCommand(ccc);
+            blockedAckMap.put(ccc.getId(), ccc);
             sendToDesignatedBackups(ccc, ccc.getPortChain());
+        } else if (c.getType().equals("RESUME_COMMAND")) {
+            resumeProcessing();
         } else if (c.getType().equals("ACK_COMMAND")) {
             blockedAckMap.remove(c.getId());
         }
 
-        if (isPaused() && !isBlockedForAck() && !isBlockedForConfigChangeAck()) {
+        if (isPaused() && !isBlockedForAck()) {
             // all acks received
             // accept the config change.
             // send command to others to resume new user traffic after processing paused traffic.
@@ -208,8 +222,9 @@ class PrimaryBackupServer implements Runnable {
             setConfigChangeCommand(null);
 
             ResumeCommand rc = new ResumeCommand();
-            sendToDesignatedBackups(rc, ccc.getPortChain());
-            resumeProcessing();
+            for (int port : ccc.getPortChain()) {
+                sendToHost(rc, port);
+            }
         }
     }
 
@@ -274,10 +289,6 @@ class PrimaryBackupServer implements Runnable {
 
                 if (isPrimary()) {
                     processAsPrimary(c);
-                    if (getCurrentTimeStamp() > startTimeStamp + 110000) {
-                        addConfigChangeCommand();
-                        startTimeStamp = getCurrentTimeStamp(); 
-                    }
                 } else {
                     processAsBackup(c);
                 }
